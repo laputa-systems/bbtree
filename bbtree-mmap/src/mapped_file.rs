@@ -102,13 +102,13 @@ impl<K: DiskStored, V: DiskStored, S: InlineKeyStrategy<K>> MappedFile<K, V, S> 
     /// The range holds a file map an [`FileWriter`] wrote, unchanged, and
     /// nothing changes or truncates the file while it is mapped: as for
     /// [`FileMap::open_unchecked`], and for any file mapped into memory.
-    pub(crate) unsafe fn mmap(file: &File, range: Range<u64>, pages: OsPages) -> io::Result<Self> {
+    pub(crate) unsafe fn mmap(file: &File, range: Range<u64>, _pages: OsPages) -> io::Result<Self> {
         let len = usize::try_from(range.end - range.start).map_err(io::Error::other)?;
         // SAFETY: the caller's: nothing changes the file while it is mapped.
         let mapping = unsafe { MmapOptions::new().offset(range.start).len(len).map(file)? };
         // Advice only: when it is not taken, the pages are small.
         #[cfg(target_os = "linux")]
-        if pages == OsPages::Huge {
+        if _pages == OsPages::Huge {
             let _ = mapping.advise(memmap2::Advice::HugePage);
         }
         // SAFETY: the mapping holds what a writer wrote (caller), and stays
