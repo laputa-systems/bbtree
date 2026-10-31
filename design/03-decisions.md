@@ -14,7 +14,9 @@ it could be merged into std someday; flag anything that would prevent that.
 **D2. Zero dependencies.** `serde` and `rand` support, when added, are
 optional features.
 
-**D3. `no_std`.**
+**D3. `no_std`.** The `std` feature, on by default, adds only what an OS
+offers: a thread waiting for a latch yields to the scheduler once a short
+spin hasn't freed it (09-concurrency.md, Latching).
 
 **D4. Two maps on one tree: `BBTreeMap`, which threads share, and
 `unsync`'s, single-threaded like std's.** (2026-10-17)
@@ -500,7 +502,7 @@ Design in 04-inline-key.md.
   ascending key order, comparing no keys: each node fills before the next
   starts beside it, and `finish` tops up the right border to the minimum
   (D22) from the full left siblings. The tree is well formed throughout but
-  for that border, so a panic part-way takes it apart as any other.
+  for that border.
 - **`collect` and `from`** sort, keep the last of equal keys (as std), and
   build. 10M u64→u64, one run: 2.02 vs std's 2.86 ns per entry, 16.3 vs
   18.2 bytes per entry.
@@ -955,6 +957,13 @@ The experiments behind D32–D45 are in [06-cost-model.md](06-cost-model.md).
     or any `&mut` access that can change the tree's structure. The next
     qualifying split sets it again. `Entry` handles never set it; clones,
     `split_off` outputs and new maps start without it.
+  - **Kept by a value update.** `get_mut` changes a value in place, which
+    moves, frees and reorders no node, so the next greater key still
+    appends. The value walks (`iter_mut`, `range_mut`) and `Entry`
+    handles keep forgetting it, as before: they hold node handles past
+    the lookup, and an entry may remove. So do removals, cuts and
+    `clear`. The shared map's owner already kept it this way
+    (`tree/latched/owner.rs`).
 - **Safety:** the check hands back a private token, and only consuming it
   moves the key and value in.
 - **Why not D30's check:** it ran in every node of every insert
@@ -968,6 +977,24 @@ The experiments behind D32–D45 are in [06-cost-model.md](06-cost-model.md).
   shortcut.
 - **Measured,** 10M ordered inserts: `u64` 31.1 → 5.3 ns (std 39.5), JSON
   121.7 → 45.3 (std 198.9), paths 185.9 → 63.1 (std 256.0).
+- **Measured,** a value update between ascending inserts used to clear it
+  and force a full descent on every insert (2026-10-26, Ryzen AI 9 HX 370,
+  release, LTO, one run each): 10M `u64` inserts, each followed by
+  `*map.get_mut(&(key / 2)) += 1`. The pair took about 103 ns per
+  insert+update before, 54 after; ascending inserts alone took about 18
+  both times. Counted through a key type whose `Ord` increments a counter,
+  comparisons per insert over 1M inserts: 23.55 before, 2.41 after — the
+  same 2.41 as ascending inserts alone, so the updates add no descent. A
+  hit in a leaf, a hit at a separator, a miss inside the shared prefix and
+  a query outside it all keep the leaf
+  (`value_updates_keep_the_rightmost_leaf`).
+- **No other workload pays:** instruction counts (callgrind, 200k `u64`
+  operations, release) of the change: hits through `get_mut` on a 200k map
+  −1.0 per lookup, random inserts unchanged, random inserts each followed
+  by a `get_mut` −2.0 per pair, ascending inserts each followed by a
+  `get_mut` −454 per pair. A later insert either appends (cheaper) or pays
+  one failed append check, which clears the leaf, so at most one such
+  check per split. No other operation reads the leaf.
 
 **D46. No software prefetch.** (2026-10-10)
 
@@ -1024,21 +1051,27 @@ Design and measurements in 07-node-plan.md.
   speculation drops `inbounds` and keeps one null test). Debug tests 86 → 75 s, from
   narrowing type recognition before comparing type identities.
 
-**D48. A panic in user code is not reconciled.** (2026-10-12)
+**D48. User code must not panic; a panic in it is not reconciled.** (2026-10-12)
 
-- **What:** when user-provided code panics (`Ord`, `InlineKey`, `Clone`,
-  `Drop`), the map does whatever is simplest. Calls into user code are not
-  ordered around changes, and a panic need not leave a valid map behind.
-- **Why:** after a panic in user code there is no state the map can
-  gracefully reconcile, and designing around it constrains every
-  structural operation.
+- **What:** user code (`Ord`, `InlineKey`, `Clone`, `Drop`, and the
+  closures the maps' methods take) must not panic, a logic error like a
+  key whose order changes (crate docs, `lib.rs`). If it does, the map does
+  whatever is simplest. Calls into user code are not ordered around
+  changes, and a panic need not leave a valid map behind.
+- **Why:** a panic is an ordinary unwind out of a call the map made, so
+  reconciling one is possible (std's `sort` keeps every element through a
+  panicking `Ord`), but every call into user code would then have to sit
+  before or after a change, or behind a guard that finishes or undoes it.
+  That constrains every structural operation, for code already wrong.
 - **Still sound:** no undefined behavior, whatever user code does (D14).
   User code runs between structural changes, not inside one, so unwinding
   never leaves what unchecked code trusts (lengths, node minimums) half
   done (D26, D37). A change that must call it inside one goes behind an
   abort-on-unwind guard, as a key's hash tag (D36), and the window an
   internal node reads again from its key (D43), do. The allocator, called
-  inside splits, must not unwind at all (D8).
+  inside splits, must not unwind at all (D8). In the shared map, the latch
+  guards unlatch on unwind, so other threads find the nodes as whole as
+  between changes.
 - **Tests:** a lying `Ord` or `InlineKey` must stay memory-safe. A
   panicking one need not leave a valid map; the tests that still check one
   (`unsync/map/tests/drops.rs`, `unsync/map/tests/inline_key.rs`,

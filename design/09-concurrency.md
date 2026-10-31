@@ -200,8 +200,10 @@ an internal node and back.
   `upgrade`).
 - **Leaves: latched to change them, and to run a closure.** Shared for
   `read`'s closure and scans, exclusive for `update` and `insert`,
-  spinning with exponential backoff. No scheduler hint: the crate is
-  `no_std` (D3). Releasing exclusively bumps the version too. Writers can
+  waiting with exponential backoff (`Backoff`): a short spin, then, with
+  the `std` feature (D3), a yield to the OS scheduler each round, as
+  crossbeam's `Backoff` does, since the holder may be preempted or running
+  a user's closure. Releasing exclusively bumps the version too. Writers can
   starve under a steady stream of readers. A lookup reads its leaf
   optimistically first, as it reads internal nodes, and latches it only
   where that doesn't settle it (Lookups, below).
@@ -234,24 +236,39 @@ No copies on either side. A racing read forms no reference into the node,
 so the aliasing model is not involved; what it reads before its check must
 not crash it or run user code on garbage:
 
-- **Routing** reads `len` and `prefix_len` once each (relaxed atomic loads,
-  so the compiler loads them once), clamps the length to the capacity, and
+- **Nothing before the check.** Whatever a racing read found, its next
+  atomic operation, and a batch lane's next yield, is its node's version
+  check: a restart, the latched way, and the latch a hint chose all wait
+  for it. The version is then a racing read's only synchronization, so a
+  replay that keeps the order of a program's atomics replays every read,
+  torn ones included. Fields read once are read volatile, not as atomics,
+  so they add none.
+- **Routing** reads `len` and `prefix_len` once each (volatile loads, so
+  the compiler loads them once), clamps the length to the capacity, and
   runs the shared inline-key search on the page's slots: any inline keys
   give an answer in bounds (D14). The shared prefix is copied out of the
   root page, as raw bytes.
-- **Edges** of the root page are followed only once the root's version
-  vouches for them: it is the one page that changes kind, so an edge read
-  from it may be a leaf's bytes. An edge read from any other node, even a
-  stale one or one past the length, is null or a pointer to a node page of
-  the kind its tag says, live or free: internal pages come zeroed and keep
-  their kind while threads share the tree (type-stable nodes, below). So
-  the descent reads the child's version before checking the parent's,
-  once, which then vouches for both.
+- **Edges** are followed only once the version of the node they were read
+  from vouches for them, and the node's version is checked again after the
+  child's is read, so the child was still the node's child then: two
+  checks a level, as in Leis et al.'s B-tree. The first orders the child's
+  page before the reader touches it. An edge read while a split wrote it
+  may lead to a page allocated a moment before, zeroed by plain writes that
+  nothing orders before the reader's access to its latch word: TSan
+  reports it, and on hardware with a weak memory model a latch taken there
+  could be lost to the zeroing. A check that holds means that the writer
+  let the node go before the reader read its version, which acquired the
+  zeroing. The check also rules out an edge of the root page that is a
+  leaf's bytes: the root page is the one page that changes kind. An edge
+  read from any other node, even a stale one or one past the length, is
+  null or a pointer to a node page of the kind its tag says, live or free:
+  internal pages come zeroed and keep their kind while threads share the
+  tree (type-stable nodes, below).
 - **Ties** compare the separator's key, the head of the leftmost leaf right
   of it (D49), with that leaf latched shared: the walk reads the node's
-  edge, checks the node's version, walks down first edges, which only a
-  thread holding the node changes, latches the leaf, and checks the node's
-  version again before comparing. The latch keeps the head in place: a
+  edge and walks down first edges, which only a thread holding the node
+  changes, checking the node's version before each step down and before it
+  latches the leaf, and again before comparing. The latch keeps the head in place: a
   removal takes out a head with its leaf latched exclusively, and its key's
   memory may be freed at once. Keys ordered by their own bytes alone, the
   std integers and byte arrays `Auto` recognizes, skip the latch: the walk
@@ -316,10 +333,11 @@ node it passes with the version it read, the edge it took and the length
 without waiting (`held.rs`), internal nodes on the path by compare-and-swap
 at the versions it read, so that each is still the parent of the next, and
 nodes beside the path at the versions they are at, reached through nodes
-it holds. Any node held by another thread, or changed, lets go of all and
-starts over. Then it runs the unsync tree's operation along a node stack from the
-topmost node it holds, as if that were the root, on the tree as it is
-(`LatchedTree::change_held`), and lets go once all is done: a reader that
+it holds. Any node held by another thread, or changed, lets go of all and,
+after a round of `Backoff`, starts over. Then it runs the unsync tree's
+operation along a node stack from the topmost node it holds, as if that
+were the root, on the tree as it is (`LatchedTree::change_held`), and lets
+go once all is done: a reader that
 read a node meanwhile fails its check. Pages it allocates it takes before
 it changes anything, and they come latched and stay so until then
 (`pages.rs`); a change of the root's kind retags the tree's root pointer
@@ -670,9 +688,9 @@ memory delivers.
 
 ## Panics
 
-Whatever is simplest. The latch guard unlatches on unwind; there is no
-poisoning; a value that a panicking `update` closure left half-changed
-stays as it is.
+User code, closures included, must not panic (D48). If it does, the latch
+guards unlatch on unwind, with no poisoning, and a value that a panicking
+`update` closure left half-changed stays as it is.
 
 ## Open
 
@@ -742,10 +760,11 @@ Shuttle (`map/shuttle_tests.rs`, `.github/workflows/shuttle.yml`) runs a test's
 threads one at a time and switches between them where the tree touches an
 atomic that threads share or waits for another thread
 (`tree/interleaving.rs`): a latch word, the root and last-leaf pointers, a
-free list, the header fields a racing read loads. Built with
+free list; and where a racing read loads a node's header fields or the
+shared prefix. Built with
 `--cfg shuttle`, like loom's `cfg(loom)`; other builds compile the points
 to nothing. Shuttle's own atomics would do the same, but the latch words
-live in node pages and racing reads load page fields in place. One thread
+live in node pages, which core's atomics access in place. One thread
 runs at a time, so Shuttle finds bad interleavings, not reorderings of a
 weak memory model, nor torn reads of a node a writer is changing.
 
@@ -805,3 +824,21 @@ outside the shared prefix started at the first entry after a shrink had
 put a key before the bound (Scans, above). No test scanned from outside
 the prefix while it shrank. `scans_from_outside_the_shared_prefix_race_a_shrink`
 does, and Shuttle finds the bug in its first schedules.
+
+### The racing reads, compiled
+
+By Rust's rules a racing read is undefined behavior, so only the compiled
+code shows that a compiler kept each read of a node before the version
+check that vouches for it, rather than loading it again after, as it may
+for a read it takes to be race-free. `bbtree/racing-reads` builds four
+operations to assembly, `get_copied` for `u64` and `String` keys,
+`get_many_copied` and `insert`, for x86-64, x86-64-v4 and AArch64.
+`check.py` follows every path from each check that passes: a read of the
+node after it, other than of its latch word or under its latch, has to meet
+another check of the node on every path that returns. CI's `racing reads`
+job runs it with the last stable releases, the latest and the pinned
+nightly. With the latest and the nightly it also plants three reloads, a
+leaf's entry read again after the leaf's check and an edge read again after
+its node's second check, in the descent and in the lanes, and fails unless
+the checker flags each where it is reached. Removals, scans and batched
+inserts aren't built.

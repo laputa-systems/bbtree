@@ -230,10 +230,16 @@ impl<K, V, S: InlineKeyStrategy<K>> LatchedTree<K, V, S> {
         if !root.latch().is_unchanged(version) {
             return false;
         }
-        // Pages below the root keep their kind (`pages.rs`): an edge read
-        // from one is null or a node of the kind its tag says.
-        matches!(child, Some(Node::Internal(child))
-            if matches!(child.racing_child(0), Some(Node::Internal(_))))
+        let Some(Node::Internal(child)) = child else {
+            return false;
+        };
+        // Its first edge, read at its version, which is checked before the
+        // read chooses how the batch runs (`node/optimistic.rs`). Pages below
+        // the root keep their kind (`pages.rs`): an edge read from one is
+        // null or a node of the kind its tag says.
+        let child_version = child.latch().read_version();
+        let grandchild = child.racing_child(0);
+        child.latch().is_unchanged(child_version) && matches!(grandchild, Some(Node::Internal(_)))
     }
 }
 
@@ -439,26 +445,34 @@ where
                     RootRead::Changed => continue 'restart,
                 };
                 if let Some(line) = self.key.window_line(node.racing_prefix_len()) {
+                    // A lane yields only on what a check vouched for: the
+                    // yield lets other lanes' atomics in (`node/optimistic.rs`).
+                    if !node.latch().is_unchanged(version) {
+                        continue 'restart;
+                    }
                     Prefetcher::fetch(line).await;
                 }
                 let mut at_separator = false;
-                let mut at_root = true;
                 loop {
                     let Some(routed) = node.route_racing(&self.key, version) else {
                         continue 'restart;
                     };
+                    // Checked before the yield, as at the root.
+                    if !node.latch().is_unchanged(version) {
+                        continue 'restart;
+                    }
                     at_separator |= routed.at_separator;
                     let edge = routed.edge as u16;
                     Prefetcher::fetch(node.edge_line(usize::from(edge))).await;
-                    let Some(child) = node.racing_child(usize::from(edge)) else {
-                        continue 'restart;
-                    };
-                    // An edge of the root page is followed only once the
-                    // root's version vouches for it (`descent.rs`).
-                    if at_root && !node.latch().is_unchanged(version) {
+                    let child = node.racing_child(usize::from(edge));
+                    // Followed only once the node's version vouches for the
+                    // edge (`descent.rs`), checked first even if it read null.
+                    if !node.latch().is_unchanged(version) {
                         continue 'restart;
                     }
-                    at_root = false;
+                    let Some(child) = child else {
+                        continue 'restart;
+                    };
                     match child {
                         Node::Leaf(leaf) => {
                             Prefetcher::fetch(leaf.search_line()).await;
@@ -525,26 +539,34 @@ where
                     RootRead::Changed => continue 'restart,
                 };
                 if let Some(line) = self.key.window_line(node.racing_prefix_len()) {
+                    // A lane yields only on what a check vouched for: the
+                    // yield lets other lanes' atomics in (`node/optimistic.rs`).
+                    if !node.latch().is_unchanged(version) {
+                        continue 'restart;
+                    }
                     Prefetcher::fetch(line).await;
                 }
                 let mut at_separator = false;
-                let mut at_root = true;
                 let leaf = loop {
                     let Some(routed) = node.route_racing(&self.key, version) else {
                         continue 'restart;
                     };
+                    // Checked before the yield, as at the root.
+                    if !node.latch().is_unchanged(version) {
+                        continue 'restart;
+                    }
                     at_separator |= routed.at_separator;
                     let edge = routed.edge as u16;
                     Prefetcher::fetch(node.edge_line(usize::from(edge))).await;
-                    let Some(child) = node.racing_child(usize::from(edge)) else {
-                        continue 'restart;
-                    };
-                    // An edge of the root page is followed only once the
-                    // root's version vouches for it (`descent.rs`).
-                    if at_root && !node.latch().is_unchanged(version) {
+                    let child = node.racing_child(usize::from(edge));
+                    // Followed only once the node's version vouches for the
+                    // edge (`descent.rs`), checked first even if it read null.
+                    if !node.latch().is_unchanged(version) {
                         continue 'restart;
                     }
-                    at_root = false;
+                    let Some(child) = child else {
+                        continue 'restart;
+                    };
                     match child {
                         Node::Leaf(leaf) => {
                             Prefetcher::fetch(leaf.search_line()).await;
@@ -566,20 +588,25 @@ where
                     }
                 };
                 let found = if at_separator {
-                    if B::COPIES
-                        && let Ok(read) = RacingRead::of_head(leaf)
-                    {
-                        let visit = &self.batch.visit;
-                        LatchedTree::settle_copy(leaf, version, read, &self.key, true, visit)
-                    } else {
-                        let visit = &self.batch.visit;
-                        LatchedTree::read_head(leaf, version, &self.key, visit).map(Some)
+                    let visit = &self.batch.visit;
+                    match B::COPIES.then(|| RacingRead::of_head(leaf)) {
+                        Some(Ok(read)) => {
+                            LatchedTree::settle_copy(leaf, version, read, &self.key, true, visit)
+                        }
+                        // A read that chose the latch: checked first, as
+                        // below.
+                        Some(Err(_)) if !leaf.latch().is_unchanged(version) => Err(Restart),
+                        _ => LatchedTree::read_head(leaf, version, &self.key, visit).map(Some),
                     }
                 } else {
                     let (candidate, prefix_len) = leaf.candidate_line_racing(&self.key);
+                    // Checked before anything the read chose: a yield, or the
+                    // latch (`node/optimistic.rs`).
+                    if !leaf.latch().is_unchanged(version) {
+                        continue 'restart;
+                    }
                     let index = match candidate {
-                        CandidateLine::Absent if leaf.latch().is_unchanged(version) => return,
-                        CandidateLine::Absent => continue 'restart,
+                        CandidateLine::Absent => return,
                         CandidateLine::One(index, line) => {
                             let (index, prefix_len) = (index as u16, prefix_len as u16);
                             Prefetcher::fetch(line).await;

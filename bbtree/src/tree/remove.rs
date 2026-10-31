@@ -43,12 +43,11 @@ impl<K, V, S: InlineKeyStrategy<K>> Tree<K, V, S> {
     /// Removes the entry whose key equals `key` and returns it, with the key
     /// as stored, counting it out of `length`; or `None` if there is none.
     ///
-    /// Every `Ord` call happens in the search, before anything changes, so a
-    /// panicking `Ord` leaves the tree unchanged. `InlineKey` runs before
-    /// anything changes too, and last, once the entry is out and counted: a
-    /// panic in that last call leaves a valid tree without the entry. Every
-    /// page a merge frees, and the one freed when an emptied root lowers the
-    /// tree, goes back to `alloc`, the map's allocator.
+    /// User code runs between changes, and inside one only behind an
+    /// abort-on-unwind guard (D48): `Ord` and `InlineKey` in the search, and
+    /// `InlineKey` again once the entry is out and counted. Every page a merge frees, and the one freed when an
+    /// emptied root lowers the tree, goes back to `alloc`, the map's
+    /// allocator.
     pub(crate) fn remove_entry<Q>(
         &mut self,
         key: &Q,
@@ -144,6 +143,18 @@ impl<K, V, S: InlineKeyStrategy<K>> NodeStackMut<'_, K, V, S> {
         alloc: &impl PageAllocator,
         length: &mut usize,
     ) -> (K, V) {
+        // A leaf that needs no fixing keeps the path to its successor. Its
+        // next key shifts into this index; past its end, the next slot leads
+        // to the separator on its right, or detaches past the tree's last.
+        if let Node::Leaf(leaf) = self.node()
+            && (leaf.keeps_its_minimum() || self.is_at_root())
+        {
+            let index = self.index();
+            let entry = leaf.remove(index);
+            *length -= 1;
+            self.go_to_entry_at_slot(index + 1);
+            return entry;
+        }
         let (entry, mut changed) = self.take_out(alloc, length);
         // The way down to the next entry: as the node stack leads above the
         // nodes the fixing changed, and as the fixing tracked it from there.

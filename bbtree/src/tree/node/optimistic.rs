@@ -10,29 +10,42 @@
 //!
 //! - goes through raw pointers and forms no reference into the node
 //!   ([`NodeInlineKeys`] over its slots, edges read from their slots);
-//! - reads the node's length once and clamps it to the capacity, so the
-//!   search stays in bounds whatever it read (D14);
-//! - follows no edge before the node's version vouches for it. The edge then
-//!   reaches a page of the kind its tag says. Every page but the root's
-//!   keeps its kind while threads share the tree. A node moved or freed
-//!   keeps its page's latch word, whose version only grows
-//!   (`tree/latched/pages.rs`);
+//! - reads the node's length once, volatile, and clamps it to the capacity,
+//!   so the search stays in bounds whatever it read (D14);
+//! - acts on nothing it read before the node's version vouches for it:
+//!   whatever it read, its next atomic operation, and a batch lane's next
+//!   yield (doc 12), is the check. The version is then a racing read's only
+//!   synchronization, so a replay that keeps the order of a program's
+//!   atomics replays every read, torn ones included. For the same reason,
+//!   fields read once are read volatile, not as atomics;
+//! - follows no edge before the node's version vouches for it, touching
+//!   neither the child's latch word nor its bytes: the check orders the
+//!   child's page, which a split may have just allocated, before the reader
+//!   (`tree/latched/descent.rs`). The edge then reaches a page of the kind
+//!   its tag says. Every page but the root's keeps its kind while threads
+//!   share the tree. A node moved or freed keeps its page's latch word,
+//!   whose version only grows (`tree/latched/pages.rs`);
 //! - runs no user code on what it read. Where inline keys tie, it compares a
 //!   separator's key, a leaf's head (D49), with that leaf latched shared,
 //!   once the node's version vouches for the edge it walked down. A head key
 //!   changes only while its leaf is latched exclusively, and the key a
 //!   removal takes out may be dropped, and its memory freed, right after.
 //!   Keys ordered by their own bytes alone (std integers and byte arrays) it
-//!   compares as an unlatched copy instead, and checks the node's version
-//!   after: a head changes only while the node holding its separator is
-//!   held.
+//!   compares as an unlatched copy instead, once the node's version vouches
+//!   for the copy: a head changes only while the node holding its separator
+//!   is held;
+//! - tells ThreadSanitizer to ignore it ([`RacingReads`]). By Rust's rules,
+//!   a plain read that races with a write is undefined behavior, checked or
+//!   not, and Rust has no way yet to read bytes that a writer changes,
+//!   padding included: RFC 3301's `AtomicPerByte` would be one. CI checks
+//!   the compiled reads instead (`bbtree/racing-reads`).
 
 use core::borrow::Borrow;
 use core::cmp::Ordering;
+use core::marker::PhantomData;
 use core::mem::{ManuallyDrop, MaybeUninit};
 use core::ops::Range;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 
 use super::Node;
 use super::hash_tags::HashTags;
@@ -95,6 +108,7 @@ impl<K, V, S: InlineKeyStrategy<K>> Leaf<K, V, S> {
         K: Borrow<Q>,
         Q: Ord + ?Sized,
     {
+        let _reads = RacingReads::begin();
         // SAFETY: the page is a leaf's, allocated while threads share the
         // tree.
         let (len, prefix_len, inline_keys) =
@@ -123,6 +137,7 @@ impl<K, V, S: InlineKeyStrategy<K>> Leaf<K, V, S> {
         K: Borrow<Q>,
         Q: Ord + ?Sized,
     {
+        let _reads = RacingReads::begin();
         // SAFETY: the page is a leaf's, allocated while threads share the
         // tree.
         let (len, prefix_len, inline_keys) =
@@ -148,6 +163,7 @@ impl<K, V, S: InlineKeyStrategy<K>> Leaf<K, V, S> {
         K: Borrow<Q>,
         Q: Ord + ?Sized,
     {
+        let _reads = RacingReads::begin();
         // SAFETY: the page is a leaf's, allocated while threads share the
         // tree.
         let (len, prefix_len, inline_keys) =
@@ -168,6 +184,39 @@ impl<K, V, S: InlineKeyStrategy<K>> Leaf<K, V, S> {
         })
     }
 
+    /// Where a bound lies among this leaf's keys, as its inline keys say,
+    /// read in place while writers may change them ([`Placed`]). `None` if
+    /// the inline keys can't place the bound. Holds only if the leaf's
+    /// version is unchanged after.
+    ///
+    /// The bound shares the leaf's prefix if it routed here through nodes
+    /// whose versions held.
+    #[inline(always)]
+    pub(in crate::tree) fn racing_place<Q>(
+        self,
+        key: &SearchKey<'_, K, S, Q>,
+    ) -> Option<Placed<K, V, S>>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        let _reads = RacingReads::begin();
+        // SAFETY: the page is a leaf's, allocated while threads share the
+        // tree.
+        let (len, prefix_len, inline_keys) =
+            unsafe { self.node_ptr().load_racing_inline_keys::<Self>() };
+        let target = key.inline_target(prefix_len)?;
+        let ties = inline_keys.equal_range(target.inline_key());
+        Some(Placed {
+            // The range is cut at `len` already; cut again against a torn
+            // read.
+            ties: ties.start.min(len)..ties.end.min(len),
+            len,
+            target,
+            leaf: PhantomData,
+        })
+    }
+
     /// A copy of key `index` and its value, read in place while writers may
     /// change them: an entry of the leaf only if its version is unchanged
     /// after ([`RacingEntry`]).
@@ -177,6 +226,7 @@ impl<K, V, S: InlineKeyStrategy<K>> Leaf<K, V, S> {
     /// In debug builds, if `index` is not below the capacity.
     #[inline(always)]
     pub(in crate::tree) fn load_racing_entry(self, index: usize) -> RacingEntry<K, V> {
+        let _reads = RacingReads::begin();
         debug_assert!(index < Self::capacity());
         let page = self.node_ptr();
         // SAFETY: `index` is below the capacity, so key slot `index` and
@@ -200,6 +250,7 @@ impl<K, V, S: InlineKeyStrategy<K>> Leaf<K, V, S> {
     /// In debug builds, if `index` is not below the capacity.
     #[inline(always)]
     pub(in crate::tree) fn load_racing_value(self, index: usize) -> MaybeUninit<V> {
+        let _reads = RacingReads::begin();
         debug_assert!(index < Self::capacity());
         // SAFETY: `index` is below the capacity, so value slot `index` is in
         // the page, which is a leaf's, allocated while threads share the
@@ -232,6 +283,7 @@ impl<K, V, S: InlineKeyStrategy<K>> Leaf<K, V, S> {
         K: Borrow<Q>,
         Q: Ord + ?Sized,
     {
+        let _reads = RacingReads::begin();
         debug_assert!(index < Self::capacity());
         if !key.ends_within_window::<Self>(prefix_len) {
             return None;
@@ -241,11 +293,11 @@ impl<K, V, S: InlineKeyStrategy<K>> Leaf<K, V, S> {
             .filter(|&tag| HashTags::is_exact_length(tag))?;
         // SAFETY: the page is a leaf's, allocated while threads share the
         // tree, and its hash tags were initialized with it (invariant 5).
-        // Tag `index`, below the capacity, is a byte in the page, read as an
-        // atomic.
+        // Tag `index`, below the capacity, is a byte in the page, read once,
+        // volatile.
         let tag = unsafe {
             let tags = self.node_ptr().key_columns::<Self>().hash_tags()?;
-            AtomicU8::from_ptr(tags.slot(index).as_ptr()).load(AtomicOrdering::Relaxed)
+            tags.slot(index).as_ptr().read_volatile()
         };
         Some(tag == query_tag)
     }
@@ -255,6 +307,7 @@ impl<K, V, S: InlineKeyStrategy<K>> Leaf<K, V, S> {
     /// read, has no head.
     #[inline(always)]
     pub(in crate::tree) fn load_racing_head_entry(self) -> Option<RacingEntry<K, V>> {
+        let _reads = RacingReads::begin();
         let page = self.node_ptr();
         // SAFETY: the page is a leaf's, allocated while threads share the tree,
         // in a map with inline keys (D49); its head key slot and head slot are
@@ -274,6 +327,7 @@ impl<K, V, S: InlineKeyStrategy<K>> Leaf<K, V, S> {
     /// whether the comparison held. `None` if the leaf, as read, has no head.
     #[inline(always)]
     fn load_racing_head_key(self) -> Option<ManuallyDrop<K>> {
+        let _reads = RacingReads::begin();
         debug_assert!(KeyInliner::<K>::orders_by_own_bytes::<S>());
         let page = self.node_ptr();
         // SAFETY: the page is a leaf's, allocated while threads share the tree,
@@ -292,7 +346,8 @@ impl<K, V, S: InlineKeyStrategy<K>> Internal<K, V, S> {
     /// [`Internal::search`] does, but in place while writers may change it.
     /// The result holds only if the version is unchanged after. `None` if a
     /// tie found the node changed, or what it read is no node any writer
-    /// left; the caller starts over.
+    /// left; the caller starts over. Only a tie returns `None`, and only
+    /// once it has checked the version: a restart on `None` follows a check.
     ///
     /// `key` shares the node's prefix if it routed here through nodes whose
     /// versions held.
@@ -322,6 +377,7 @@ impl<K, V, S: InlineKeyStrategy<K>> Internal<K, V, S> {
         K: Borrow<Q>,
         Q: Ord + ?Sized,
     {
+        let _reads = RacingReads::begin();
         // SAFETY: the page is an internal node's, allocated while threads
         // share the tree.
         let (len, prefix_len, inline_keys) =
@@ -368,13 +424,7 @@ impl<K, V, S: InlineKeyStrategy<K>> Internal<K, V, S> {
         let (mut low, mut high) = (tie.candidates.start, tie.candidates.end);
         while low < high {
             let middle = low + (high - low) / 2;
-            let child = self.racing_child(middle + 1)?;
-            // SAFETY: the tree is latched (`route_racing`'s caller), and its
-            // pages stay node pages of their kind (`tree/latched`).
-            if !unsafe { self.node_ptr().latch() }.is_unchanged(version) {
-                return None;
-            }
-            let leaf = child.racing_leftmost_leaf()?;
+            let leaf = self.racing_leftmost_leaf(middle + 1, version)?;
             match self.cmp_separator_head(leaf, version, key, tie.target)? {
                 Ordering::Less => high = middle,
                 Ordering::Greater => low = middle + 1,
@@ -417,11 +467,11 @@ impl<K, V, S: InlineKeyStrategy<K>> Internal<K, V, S> {
         if KeyInliner::<K>::orders_by_own_bytes::<S>() {
             // Without the latch: the head changes only while this node is
             // held (`tree/latched/held.rs`), which its version tells.
-            let head = leaf.load_racing_head_key()?;
-            let ordering = cmp(&head);
-            return latch_of(self.node_ptr())
-                .is_unchanged(version)
-                .then_some(ordering);
+            let head = leaf.load_racing_head_key();
+            if !latch_of(self.node_ptr()).is_unchanged(version) {
+                return None;
+            }
+            return head.map(|head| cmp(&head));
         }
         let latched = SharedLatch::lock(latch_of(leaf.node_ptr()));
         let ordering = (latch_of(self.node_ptr()).is_unchanged(version) && leaf.has_head())
@@ -450,6 +500,28 @@ impl<K, V, S: InlineKeyStrategy<K>> Internal<K, V, S> {
         prefix_len
     }
 
+    /// The leftmost leaf below edge `edge`, down first edges from there,
+    /// each read in place while writers may change it. Only a thread holding
+    /// this node, read at `version`, changes them, so the walk follows each
+    /// once the version vouches for it (`tree/latched/descent.rs`). `None` if
+    /// the node changed, or the walk meets a null edge.
+    #[inline(always)]
+    fn racing_leftmost_leaf(self, edge: usize, version: Version) -> Option<Leaf<K, V, S>> {
+        // SAFETY: the tree is latched (`route_racing`'s caller), and its
+        // pages stay node pages of their kind (`tree/latched`).
+        let latch = unsafe { self.node_ptr().latch() };
+        let mut child = self.racing_child(edge);
+        loop {
+            if !latch.is_unchanged(version) {
+                return None;
+            }
+            child = match child? {
+                Node::Leaf(leaf) => return Some(leaf),
+                Node::Internal(internal) => internal.racing_child(0),
+            };
+        }
+    }
+
     /// The child at edge `index`, read in place while writers may change
     /// it: what a writer stored there, or `None` for an edge none has.
     ///
@@ -458,6 +530,7 @@ impl<K, V, S: InlineKeyStrategy<K>> Internal<K, V, S> {
     /// In debug builds, if `index > capacity`.
     #[inline(always)]
     pub(in crate::tree) fn racing_child(self, index: usize) -> Option<Node<K, V, S>> {
+        let _reads = RacingReads::begin();
         debug_assert!(index <= Self::capacity());
         // SAFETY: `index <= capacity`, so the edge slot is in the page, which
         // is allocated while threads share the tree. The slot is aligned for a
@@ -468,23 +541,6 @@ impl<K, V, S: InlineKeyStrategy<K>> Internal<K, V, S> {
             let slot = self.node_ptr().edge_slots().slot(index);
             let tagged = slot.cast::<*mut u8>().read();
             NonNull::new(tagged).map(|tagged| Node::at(NodePtr::from_tagged(tagged)))
-        }
-    }
-}
-
-impl<K, V, S: InlineKeyStrategy<K>> Node<K, V, S> {
-    /// The leftmost leaf of this node, down first edges read in place while
-    /// writers may change them. The leaf reached holds only while the node
-    /// above this one is unchanged, which only a thread holding that node
-    /// changes. `None` if the walk meets a null edge.
-    #[inline(always)]
-    fn racing_leftmost_leaf(self) -> Option<Leaf<K, V, S>> {
-        let mut node = self;
-        loop {
-            node = match node {
-                Node::Leaf(leaf) => return Some(leaf),
-                Node::Internal(internal) => internal.racing_child(0)?,
-            };
         }
     }
 }
@@ -516,6 +572,34 @@ impl<K, V, S: InlineKeyStrategy<K>> NodePtr<K, V, S> {
                 .expect("a latched tree's keys have inline keys");
             (len, prefix_len, NodeInlineKeys::new(slots, capacity, len))
         }
+    }
+}
+
+/// Where a bound lies among a leaf's keys, as the leaf's inline keys said
+/// when read in place ([`Leaf::racing_place`]): the keys whose inline keys
+/// equal the bound's, and the leaf's length as read. The keys before the
+/// range sort before the bound, those after it after; those in it compare
+/// in full ([`Self::cmp_tied`]).
+pub(in crate::tree) struct Placed<K, V, S> {
+    pub(in crate::tree) ties: Range<usize>,
+    pub(in crate::tree) len: usize,
+    /// The bound's window at the leaf's prefix length, which the comparison
+    /// of a tie starts past.
+    target: Window,
+    leaf: PhantomData<Leaf<K, V, S>>,
+}
+
+impl<K, V, S: InlineKeyStrategy<K>> Placed<K, V, S> {
+    /// How `key`, the bound placed, orders against `stored`, a key of the
+    /// leaf among the ties, compared from past the bytes they are known to
+    /// share, as a latched search compares its candidates.
+    #[inline(always)]
+    pub(in crate::tree) fn cmp_tied<Q>(&self, key: &SearchKey<'_, K, S, Q>, stored: &K) -> Ordering
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        key.cmp_tied::<Leaf<K, V, S>>(self.target, stored)
     }
 }
 
@@ -552,6 +636,42 @@ impl<K, V> RacingEntry<K, V> {
                 ManuallyDrop::new(self.value.assume_init()),
             )
         }
+    }
+}
+
+/// One of the reads above, while it lasts: a TSan build (`--cfg tsan`,
+/// `.github/workflows/sanitizer.yml`) ignores the thread's memory accesses
+/// meanwhile, which are racing reads the version check after vouches for,
+/// and only those. TSan still checks every write, and the latch words read
+/// outside it. Nothing in other builds.
+#[must_use]
+pub(in crate::tree) struct RacingReads(());
+
+impl RacingReads {
+    #[inline(always)]
+    pub(in crate::tree) fn begin() -> Self {
+        #[cfg(tsan)]
+        tsan::AnnotateIgnoreReadsBegin(c"bbtree".as_ptr(), 0);
+        Self(())
+    }
+}
+
+#[cfg(tsan)]
+impl Drop for RacingReads {
+    fn drop(&mut self) {
+        tsan::AnnotateIgnoreReadsEnd(c"bbtree".as_ptr(), 0);
+    }
+}
+
+/// TSan's runtime, which a `-Zsanitizer=thread` build links: its dynamic
+/// annotations for reads that race on purpose.
+#[cfg(tsan)]
+mod tsan {
+    use core::ffi::{c_char, c_int};
+
+    unsafe extern "C" {
+        pub(super) safe fn AnnotateIgnoreReadsBegin(file: *const c_char, line: c_int);
+        pub(super) safe fn AnnotateIgnoreReadsEnd(file: *const c_char, line: c_int);
     }
 }
 
